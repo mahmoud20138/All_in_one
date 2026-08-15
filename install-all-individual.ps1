@@ -2,26 +2,63 @@
 param(
     [ValidateSet('all','claude','codex','opencode','hermes','auto')]
     [string]$Targets = 'all',
+    [ValidateSet('top10','top25','top50','all')]
+    [string]$InstallSet = 'all',
+    [string]$Workspace = '',
+    [switch]$CleanWorkspace,
+    [switch]$CleanDownloads,
+    [switch]$ScanDownloads,
     [switch]$NoRepair,
     [switch]$InstallRepoDeps,
-    [switch]$Force
+    [switch]$Force,
+    [switch]$AllowPartial
 )
 
 $ErrorActionPreference = 'Continue'
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Catalog = Join-Path $Root 'individual_extensions_catalog.csv'
 $Stamp = (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ')
-$Base = if ($env:AI_AGENT_EXTENSIONS_DIR) { $env:AI_AGENT_EXTENSIONS_DIR } else { Join-Path $env:LOCALAPPDATA 'ai-agent-individual-extensions' }
+$Base = if ($Workspace) { $Workspace } elseif ($env:AI_AGENT_EXTENSIONS_DIR) { $env:AI_AGENT_EXTENSIONS_DIR } else { Join-Path $env:LOCALAPPDATA 'ai-agent-individual-extensions' }
+$Downloads = Join-Path $HOME 'Downloads'
+function CanonicalPath([string]$Path) { return [System.IO.Path]::GetFullPath($Path).TrimEnd('\\') }
+$baseCanonical = CanonicalPath $Base
+$downloadsCanonical = CanonicalPath $Downloads
+if (($baseCanonical -eq $downloadsCanonical) -or $baseCanonical.StartsWith($downloadsCanonical + '\\', [System.StringComparison]::OrdinalIgnoreCase)) {
+    Write-Error "Refusing to use Downloads or a subfolder of Downloads as the clone workspace. Choose a dedicated path outside Downloads."
+    exit 7
+}
 $RepoDir = Join-Path $Base 'repos'
-$BackupDir = Join-Path $Base "backups\$Stamp"
+$BackupDir = Join-Path $Base "backups\\$Stamp"
 $ReportDir = Join-Path $Base 'reports'
 $LogPath = Join-Path $ReportDir "install-$Stamp.log"
 $StatusPath = Join-Path $ReportDir "install-status-$Stamp.csv"
 $ReqPath = Join-Path $ReportDir "requirements-$Stamp.csv"
 $McpPath = Join-Path $ReportDir "mcp-registry-$Stamp.json"
 $PluginPath = Join-Path $ReportDir "plugin-sources-$Stamp.json"
-
+$FinalPath = Join-Path $ReportDir "install-final-$Stamp.csv"
+$DownloadsScanPath = Join-Path $ReportDir "downloads-scan-$Stamp.csv"
+$WorkspaceMarker = Join-Path $Base '.ai-agent-individual-extensions-workspace'
+if ($CleanWorkspace) {
+    if (-not (Test-Path $WorkspaceMarker)) { Write-Error "Refusing to delete a workspace without the installer marker: $Base"; exit 8 }
+    Remove-Item -LiteralPath $Base -Recurse -Force
+    Write-Host "Removed installer-created workspace: $Base"
+    exit 0
+}
 New-Item -ItemType Directory -Force -Path $RepoDir,$ReportDir | Out-Null
+Set-Content -LiteralPath $WorkspaceMarker -Value "created_by=individual-extension-installer`ncreated_at=$Stamp`nroot=$Base`nclones_outside_downloads=true" -Encoding utf8
+if ($ScanDownloads) {
+    $downloadRows = @()
+    if (Test-Path $Downloads) {
+        Get-ChildItem -LiteralPath $Downloads -Directory -Force -ErrorAction SilentlyContinue | ForEach-Object {
+            if (Test-Path (Join-Path $_.FullName '.git')) {
+                $downloadRows += [pscustomobject]@{ path=$_.FullName; state='existing-git-directory'; action='not touched by installer'; note='Review manually; installer never clones into Downloads.' }
+            }
+        }
+    }
+    if ($downloadRows.Count -eq 0) { $downloadRows += [pscustomobject]@{ path=$Downloads; state='clean-for-installer'; action='none'; note='No top-level Git clone detected; installer does not use Downloads.' } }
+    $downloadRows | Export-Csv -NoTypeInformation -Encoding utf8 $DownloadsScanPath
+}
+
 function Log([string]$Message) {
     $line = "$(Get-Date -Format s) $Message"
     Add-Content -Path $LogPath -Value $line
@@ -55,6 +92,30 @@ if (-not (CommandExists 'npm') -and (CommandExists 'node')) { Log 'MISSING: npm;
 if (-not (Test-Path $Catalog)) { Log "STOP: Catalog not found: $Catalog"; exit 3 }
 $Rows = @(Import-Csv $Catalog | Where-Object { $_.repo -and $_.rank -and ([int]$_.rank -le 100) } | Sort-Object { [int]$_.rank })
 if ($Rows.Count -ne 100) { Log "STOP: Expected 100 catalog rows, found $($Rows.Count)."; exit 4 }
+$RequestedCount = switch ($InstallSet) { 'top10' { 10 } 'top25' { 25 } 'top50' { 50 } default { 100 } }
+$Rows = @($Rows | Where-Object { [int]$_.rank -le $RequestedCount })
+$ScopeLabel = if ($RequestedCount -eq 100) { 'all-100' } else { "top-$RequestedCount" }
+Log "INSTALL SET: $ScopeLabel; processing $($Rows.Count) ranked repositories."
+if ($CleanDownloads) {
+    $cleanupRows = @()
+    foreach ($Row in $Rows) {
+        $candidate = Join-Path $Downloads $Row.repo.Replace('/','__')
+        if (Test-Path (Join-Path $candidate '.git')) {
+            $origin = (& git -C $candidate remote get-url origin 2>$null | Select-Object -First 1)
+            if ($origin -and ($origin.TrimEnd('/') -eq $Row.url.TrimEnd('/'))) {
+                Remove-Item -LiteralPath $candidate -Recurse -Force
+                $cleanupRows += [pscustomobject]@{ path=$candidate; state='removed'; repo=$Row.repo; reason='catalog URL matched installer clone naming' }
+                Log "CLEAN DOWNLOADS: removed known installer clone $candidate"
+            } else {
+                $cleanupRows += [pscustomobject]@{ path=$candidate; state='skipped'; repo=$Row.repo; reason='origin URL did not match catalog; not touched' }
+            }
+        }
+    }
+    $cleanupPath = Join-Path $ReportDir "downloads-cleanup-$Stamp.csv"
+    if ($cleanupRows.Count -eq 0) { $cleanupRows += [pscustomobject]@{ path=$Downloads; state='clean-for-known-clones'; repo=''; reason='no matching catalog clone was removed' } }
+    $cleanupRows | Export-Csv -NoTypeInformation -Encoding utf8 $cleanupPath
+    Log "DOWNLOADS CLEANUP: $cleanupPath"
+}
 $needsGo = @($Rows | Where-Object { $_.primary_language -match '(?i)^Go$' }).Count -gt 0
 $needsRust = @($Rows | Where-Object { $_.primary_language -match '(?i)Rust' }).Count -gt 0
 if ($needsGo -and -not (CommandExists 'go')) {
@@ -119,7 +180,7 @@ function Clone-Repo($Row) {
         & git -C $path fetch --depth 1 origin 2>&1 | ForEach-Object { Add-Content $LogPath $_ }
         & git -C $path reset --hard origin/HEAD 2>&1 | ForEach-Object { Add-Content $LogPath $_ }
         if ($LASTEXITCODE -eq 0) { return $path }
-        Log "WARN: update failed; retaining existing clone for $($Row.repo)."; return $path
+        Log "ERROR: update failed for $($Row.repo); strict mode will mark this repository failed."; return $null
     }
     if (Test-Path $path) { Log "ERROR: non-git path blocks clone: $path"; return $null }
     Log "CLONE: $($Row.repo)"
@@ -216,14 +277,54 @@ foreach ($Row in $Rows) {
     }
 }
 
+$Final = @()
+foreach ($Row in $Rows) {
+    $cloneStatus = @($Statuses | Where-Object { ([int]$_.rank -eq [int]$Row.rank) -and $_.stage -eq 'clone' } | Select-Object -Last 1)
+    $cloneState = if ($cloneStatus.Count -gt 0) { $cloneStatus[0].state } else { 'missing' }
+    $rowSkillStatuses = @($Statuses | Where-Object { ([int]$_.rank -eq [int]$Row.rank) -and $_.stage -eq 'skill' })
+    $installedSkillStatuses = @($rowSkillStatuses | Where-Object { $_.state -eq 'installed' })
+    $dependencyRows = @($Requirements | Where-Object { [int]$_.rank -eq [int]$Row.rank })
+    $dependencyStatusRows = @($Statuses | Where-Object { ([int]$_.rank -eq [int]$Row.rank) -and $_.stage -eq 'dependencies' })
+    $dependencyState = 'not-detected'
+    if (@($dependencyRows | Where-Object { $_.state -eq 'missing' }).Count -gt 0) { $dependencyState = 'missing' }
+    elseif (@($dependencyStatusRows | Where-Object { $_.state -eq 'failed' }).Count -gt 0) { $dependencyState = 'failed' }
+    elseif ($dependencyRows.Count -gt 0) { $dependencyState = 'available-or-installed' }
+    $isSkill = $Row.extension_type -like 'Agent skill*'
+    $artifactState = if ($isSkill) { if ($installedSkillStatuses.Count -gt 0) { 'installed' } else { 'not-found' } } else { 'staged' }
+    $finalState = if ($cloneState -ne 'ready') { 'clone-failed' } elseif ($isSkill -and $artifactState -ne 'installed') { 'skill-not-installed' } elseif ($Row.extension_type -like 'MCP*') { 'mcp-staged-host-registration-pending' } elseif ($Row.extension_type -like 'Plugin*') { 'plugin-staged-host-registration-pending' } else { 'processed' }
+    $readyForUse = if ($isSkill) { ($finalState -eq 'processed') } else { $false }
+    $unresolved = @()
+    if ($cloneState -ne 'ready') { $unresolved += 'Repository clone/update failed' }
+    if ($isSkill -and $artifactState -ne 'installed') { $unresolved += 'No valid SKILL.md was installed' }
+    if (-not $isSkill) { $unresolved += 'Host registration and runtime-specific activation were not attempted automatically' }
+    if ($dependencyState -eq 'missing') { $unresolved += 'One or more runtime or credential requirements are missing' }
+    if ($dependencyState -eq 'failed') { $unresolved += 'One or more dependency installation commands failed' }
+    $Final += [pscustomobject]@{
+        scope=$ScopeLabel; rank=$Row.rank; repo=$Row.repo; type=$Row.extension_type; url=$Row.url; clone_state=$cloneState; artifact_state=$artifactState;
+        dependency_state=$dependencyState; final_state=$finalState; ready_for_use=$readyForUse;
+        unresolved=($unresolved -join ' | '); local_repo_path=(Join-Path $RepoDir $Row.repo.Replace('/','__'))
+    }
+}
+$expectedRanks = 1..$RequestedCount
+$actualRanks = @($Final | ForEach-Object { [int]$_.rank } | Sort-Object -Unique)
+$missingRanks = @($expectedRanks | Where-Object { $_ -notin $actualRanks })
+$hardFailures = @($Final | Where-Object { $_.final_state -in @('clone-failed','skill-not-installed') })
+$Final | Export-Csv -NoTypeInformation -Encoding utf8 $FinalPath
 $Statuses | Export-Csv -NoTypeInformation -Encoding utf8 $StatusPath
 $Requirements | Export-Csv -NoTypeInformation -Encoding utf8 $ReqPath
 $McpRegistry | ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8 $McpPath
 $PluginSources | ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8 $PluginPath
-Log "DONE: individual extension installation/staging finished."
+Log "DONE: processed $($Final.Count) of $RequestedCount selected catalog repositories ($ScopeLabel)."
+Log "FINAL REPORT: $FinalPath"
 Log "STATUS: $StatusPath"
 Log "REQUIREMENTS: $ReqPath"
 Log "MCP REGISTRY: $McpPath"
 Log "PLUGIN SOURCES: $PluginPath"
-Write-Host "`nComplete. This run kept all repositories and skills separate; nothing was merged."
-Write-Host "Review the requirements report before installing repository-specific dependencies or configuring credentials."
+if ($ScanDownloads) { Log "DOWNLOADS SCAN: $DownloadsScanPath" }
+Log "SUMMARY: skills installed=$(@($Final | Where-Object { $_.artifact_state -eq 'installed' }).Count); plugins staged=$(@($Final | Where-Object { $_.final_state -like 'plugin-*' }).Count); MCP staged=$(@($Final | Where-Object { $_.final_state -like 'mcp-*' }).Count); hard failures=$($hardFailures.Count); missing catalog ranks=$($missingRanks.Count)"
+Write-Host "`nAll $RequestedCount selected catalog rows ($ScopeLabel) were processed as individual repositories; nothing was merged."
+Write-Host "Plugin/MCP entries are staged separately and remain pending host-specific registration and credentials."
+if (($missingRanks.Count -gt 0 -or $hardFailures.Count -gt 0) -and -not $AllowPartial) {
+    Log "FAIL: strict completion check failed. Use the final report to repair issues, or rerun with -AllowPartial only if partial processing is intentional."
+    exit 20
+}
