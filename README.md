@@ -4,7 +4,7 @@ This repository provides a Windows one-shot installer for the **100 individual s
 
 ## Quick start
 
-Download or clone this repository on Windows, then double-click `install-all-individual.bat` for all 100 entries. You can also pass a ranked scope from Command Prompt:
+Download or clone this repository on Windows, then double-click `install-all-individual.bat`. The launcher now displays an interactive menu with **Top 10**, **Top 25**, **Top 50**, **All 100**, and **Quit** choices. You can also pass a ranked scope directly from Command Prompt:
 
 ```bat
 install-all-individual.bat top10
@@ -46,7 +46,7 @@ Repository files, README content, issues, scripts, downloaded artifacts, and ext
 
 ## Command options
 
-The PowerShell installer supports `-InstallSet top10|top25|top50|all`, `-Targets all|auto|claude|codex|opencode|hermes`, `-Workspace` for a dedicated non-Downloads clone root, `-ScanDownloads` for a non-destructive scan, `-CleanWorkspace` for marker-protected cleanup, `-NoRepair` to report missing runtimes without attempting `winget`, `-InstallRepoDeps` to install repository-local dependencies, `-Force` to replace existing same-name skills, and `-AllowPartial` to opt out of strict clone/skill failure handling. The batch launcher passes `-Targets all -InstallSet <selected-scope> -InstallRepoDeps` by default and keeps strict completion enabled.
+The PowerShell installer supports `-InstallSet top10|top25|top50|all`, `-Targets all|auto|claude|codex|opencode|hermes`, `-Workspace` for a dedicated non-Downloads clone root, `-ScanDownloads` for a non-destructive scan, `-CleanWorkspace` for marker-protected cleanup, `-NoRepair` to report missing runtimes without attempting `winget`, `-InstallRepoDeps` to install repository-local dependencies, `-Force` to replace existing same-name skills, and `-AllowPartial` to opt out of strict clone/skill failure handling. The batch launcher passes `-Targets all -InstallSet <selected-scope> -InstallRepoDeps` by default and keeps strict completion enabled. If no scope is supplied, the interactive menu sets `<selected-scope>` before PowerShell starts.
 
 ## Source catalog
 
